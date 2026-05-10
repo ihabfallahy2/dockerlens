@@ -1,6 +1,7 @@
 import asyncio
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -15,6 +16,12 @@ READ_ONLY = os.getenv("READ_ONLY", "false").lower() == "true"
 
 app = FastAPI(title="dockerlens")
 client = docker.from_env()
+
+# estado global del caché
+_cache: list = []
+_cache_lock = threading.Lock()
+_cache_ready = threading.Event()
+INVALIDATING_EVENTS = {"start", "stop", "die", "kill", "restart", "pause", "unpause", "destroy"}
 
 
 def parse_docker_dt(value: str | None) -> datetime | None:
@@ -164,12 +171,79 @@ def get_container(cid: str):
         raise HTTPException(500, str(exc)) from exc
 
 
-@app.get("/api/containers")
-def list_containers():
+def _do_refresh():
+    """Función extraída de _refresh_cache para poder llamarla bajo demanda."""
     try:
         containers = client.containers.list(all=True)
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            return list(executor.map(container_payload, containers))
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            result = list(ex.map(container_payload, containers))
+        with _cache_lock:
+            global _cache
+            _cache = result
+        _cache_ready.set()
+    except Exception:
+        _cache_ready.set()
+
+
+def _refresh_cache():
+    """Refresca el caché en background cada 5 segundos."""
+    while True:
+        _do_refresh()
+        time.sleep(5)
+
+
+def _watch_docker_events():
+    """Escucha eventos Docker e invalida el caché cuando hay cambios de estado."""
+    while True:
+        try:
+            for event in client.events(decode=True):
+                action = event.get("Action", "")
+                etype = event.get("Type", "")
+                if etype == "container" and action in INVALIDATING_EVENTS:
+                    # forzar refresco inmediato del caché
+                    _do_refresh()
+        except Exception:
+            time.sleep(2)  # reconectar tras error
+
+
+@app.on_event("startup")
+def start_background_refresh():
+    threading.Thread(target=_refresh_cache, daemon=True).start()
+    threading.Thread(target=_watch_docker_events, daemon=True).start()
+
+
+@app.get("/api/containers")
+def list_containers():
+    # esperar máximo 10s al primer refresco si el caché está vacío
+    _cache_ready.wait(timeout=10)
+    with _cache_lock:
+        return list(_cache)
+
+
+@app.get("/api/containers/meta")
+def list_containers_meta():
+    """Devuelve metadatos sin stats. Respuesta inmediata."""
+    try:
+        containers = client.containers.list(all=True)
+        result = []
+        for c in containers:
+            c.reload()
+            attrs = c.attrs
+            state = attrs.get("State") or {}
+            status = status_from(attrs)
+            result.append({
+                "id": c.id[:12],
+                "name": attrs.get("Name", c.name).lstrip("/") or c.name,
+                "image": image_name(c, attrs),
+                "imageFull": (attrs.get("Config") or {}).get("Image") or image_name(c, attrs),
+                "status": status,
+                "uptime": uptime_from(state.get("StartedAt"), status == "running"),
+                "ports": format_ports(attrs),
+                "restart": restart_policy(attrs),
+                "network": networks(attrs),
+                "created": (parse_docker_dt(attrs.get("Created")) or datetime.now(timezone.utc)).date().isoformat(),
+            })
+        return result
     except APIError as exc:
         raise HTTPException(500, str(exc)) from exc
 
