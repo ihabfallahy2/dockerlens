@@ -1,6 +1,7 @@
 import asyncio
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import docker
@@ -163,17 +164,12 @@ def get_container(cid: str):
         raise HTTPException(500, str(exc)) from exc
 
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    with open("static/index.html", "r", encoding="utf-8") as fh:
-        return fh.read()
-
-
 @app.get("/api/containers")
 def list_containers():
     try:
         containers = client.containers.list(all=True)
-        return [container_payload(container) for container in containers]
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            return list(executor.map(container_payload, containers))
     except APIError as exc:
         raise HTTPException(500, str(exc)) from exc
 
@@ -265,4 +261,4 @@ async def logs_ws(websocket: WebSocket, cid: str):
             log_iter.close()
 
 
-app.mount("/", StaticFiles(directory="static"), name="static")
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
