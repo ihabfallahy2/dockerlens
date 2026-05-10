@@ -1,0 +1,13 @@
+services:
+  dockerlens:
+    image: dockerlens
+    build: .
+    container_name: dockerlens
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - PYTHONUNBUFFERED=1
+      - READ_ONLY=false
